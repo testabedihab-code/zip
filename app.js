@@ -43,8 +43,10 @@ let heroIdx=0,heroTimer;
 function initHero(){
   const bg=document.getElementById('heroBg');
   const dots=document.getElementById('heroDots');
-  bg.innerHTML=HERO_IMGS.map((src,i)=>`<img src="${src}" alt="" class="${i===0?'active':''}" ${i>0?'loading="lazy"':''}>`).join('');
-  dots.innerHTML=HERO_IMGS.map((_,i)=>`<span class="${i===0?'active':''}"></span>`).join('');
+  // HERO_IMGS تأتي من Firestore (تُحدَّث بـ onSnapshot في Firebase init)
+  const imgs = (window._heroImgs && window._heroImgs.length) ? window._heroImgs : HERO_IMGS;
+  bg.innerHTML=imgs.map((src,i)=>`<img src="${src}" alt="" class="${i===0?'active':''}" ${i>0?'loading="lazy"':''}>`).join('');
+  dots.innerHTML=imgs.map((_,i)=>`<span class="${i===0?'active':''}"></span>`).join('');
   clearInterval(heroTimer);
   heroTimer=setInterval(()=>{
     heroIdx=(heroIdx+1)%HERO_IMGS.length;
@@ -148,6 +150,14 @@ function nav(page){
 /* ===== HOME ===== */
 function renderHome(){
   initHero();
+  
+  // إذا ما في إعلانات بعد — اعرض skeleton
+  if (listings.length === 0) {
+    const skeletonCard = `<div style="width:160px;height:200px;border-radius:14px;background:linear-gradient(90deg,#f0f4fb 25%,#e8eff8 50%,#f0f4fb 75%);background-size:200% 100%;animation:shimmer 1.2s infinite;flex-shrink:0"></div>`;
+    document.getElementById('featScroll').innerHTML = Array(4).fill(skeletonCard).join('');
+    document.getElementById('latestGrid').innerHTML = Array(6).fill(skeletonCard.replace('160px','100%')).join('');
+    return;
+  }
   
   // Categories (merged: شقق + سيارات)
   const mergedCats=[
@@ -745,14 +755,24 @@ function selectMonth(val,dailyPrice){
   if(barDates) barDates.textContent=m===-1?'مدة مفتوحة':m+' شهر';
 }
 
-// ===== BRIDGE: حفظ الطلب في localStorage لاستقباله في الأدمن =====
-// عند الربط بـ Firebase سيُستبدل هذا بـ addDoc إلى Firestore
-function _saveIncomingDeal(deal) {
+// ===== حفظ الطلب في Firestore + localStorage =====
+async function _saveIncomingDeal(deal) {
+  // localStorage — fallback
   try {
     const deals = JSON.parse(localStorage.getItem('tam_incoming_deals') || '[]');
     deals.unshift(deal);
     localStorage.setItem('tam_incoming_deals', JSON.stringify(deals));
-  } catch(e) { console.warn('[Bridge] Failed to save deal:', e); }
+  } catch(e) {}
+  // Firestore — الحل الرئيسي
+  try {
+    const FB = window._FBSITE;
+    if (!FB) return;
+    const ref = await FB.addDoc(FB.collection(FB.db, 'incomingDeals'), {
+      ...deal,
+      createdAt: FB.serverTimestamp()
+    });
+    console.log('[FS] incomingDeal saved:', ref.id);
+  } catch(e) { console.warn('[FS] _saveIncomingDeal:', e); }
 }
 
 function submitMonthlyBooking(id){
@@ -1042,7 +1062,7 @@ function clearCal(){_calStart=null;_calEnd=null;renderCal();}
 function renderCal(){
   document.getElementById('calMonth').textContent=MONTHS[calM]+' '+calY;
   const fd=new Date(calY,calM,1).getDay(),dm=new Date(calY,calM+1,0).getDate(),td=new Date();td.setHours(0,0,0,0);
-  // Get booked dates for current listing
+  // قراءة التواريخ المحجوزة من localStorage (يتم تحديثه من Firestore)
   const _bookedDates=JSON.parse(localStorage.getItem('tam_booked')||'{}');
   const lid=window._currentListing?String(window._currentListing.id):null;
   const booked=lid?(_bookedDates[lid]||[]):[];
@@ -1169,8 +1189,16 @@ window.addEventListener('resize',()=>{
   else hideLaptopNav();
 });
 
-// Init
-renderHome();
+// Init — نؤجل الرسم حتى يحمّل Firebase الإعلانات
+// إذا Firebase ما اشتغل خلال 3 ثوان نرسم بما عندنا
+let _firebaseLoaded = false;
+window._onFirebaseReady = function() {
+  _firebaseLoaded = true;
+  renderHome();
+};
+setTimeout(() => {
+  if (!_firebaseLoaded) renderHome();
+}, 3000);
 
 /* ===== PWA INSTALL BANNER ===== */
 let deferredPrompt = null;
@@ -1218,6 +1246,81 @@ function hideInstallBanner(){
   const b = document.getElementById('installBanner');
   if(b) b.remove();
 }
+
+// ===== FIREBASE INIT (الموقع الأساسي) =====
+(async () => {
+  try {
+    const { initializeApp }       = await import("https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js");
+    const { getFirestore, collection, addDoc, doc, getDoc, setDoc, onSnapshot, query, orderBy, serverTimestamp }
+                                  = await import("https://www.gstatic.com/firebasejs/12.11.0/firebase-firestore.js");
+
+    const firebaseConfig = {
+      apiKey:            "AIzaSyCbbswCo--QVE2YJ1sL0ukLJpESW3B83-8",
+      authDomain:        "talabaktam-9f229.firebaseapp.com",
+      projectId:         "talabaktam-9f229",
+      storageBucket:     "talabaktam-9f229.firebasestorage.app",
+      messagingSenderId: "379089138361",
+      appId:             "1:379089138361:web:bc8920777d6dbfcffe6168"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db  = getFirestore(app);
+
+    window._FBSITE = { db, collection, addDoc, doc, getDoc, setDoc, serverTimestamp };
+
+    // ===== قراءة الإعلانات من Firestore (real-time) =====
+    let _firstLoad = true;
+    onSnapshot(
+      query(collection(db, 'listings'), orderBy('date', 'desc')),
+      snap => {
+        listings.length = 0;
+        snap.forEach(d => listings.push({ _fsId: d.id, ...d.data() }));
+        if (_firstLoad) {
+          _firstLoad = false;
+          if (typeof window._onFirebaseReady === 'function') window._onFirebaseReady();
+        } else {
+          if (typeof renderHome === 'function') renderHome();
+        }
+      },
+      err => {
+        console.warn('[FS] listings:', err);
+        if (typeof window._onFirebaseReady === 'function') window._onFirebaseReady();
+      }
+    );
+
+    // ===== قراءة صور الهيرو من Firestore =====
+    onSnapshot(doc(db, 'settings', 'hero'), snap => {
+      if (snap.exists() && snap.data().images && snap.data().images.length > 0) {
+        window._heroImgs = snap.data().images;
+        // إعادة تحميل الهيرو
+        if (typeof initHero === 'function') {
+          HERO_IMGS.length = 0;
+          snap.data().images.forEach(img => HERO_IMGS.push(img));
+          initHero();
+        }
+      }
+    }, () => {});
+
+    // ===== قراءة التواريخ المحجوزة من Firestore =====
+    onSnapshot(
+      collection(db, 'bookedDates'),
+      snap => {
+        try {
+          const allBooked = JSON.parse(localStorage.getItem('tam_booked') || '{}');
+          snap.forEach(d => { allBooked[d.id] = d.data().dates || []; });
+          localStorage.setItem('tam_booked', JSON.stringify(allBooked));
+          // إعادة رسم التقويم إذا كان مفتوحاً
+          if (typeof renderCal === 'function' && window._currentListing) renderCal();
+        } catch(e) {}
+      },
+      err => console.warn('[FS] bookedDates:', err)
+    );
+
+    console.log('[Firebase] ✅ Site connected');
+  } catch(e) {
+    console.warn('[Firebase] Init failed — running offline:', e);
+  }
+})();
 
 // Service Worker registration
 if('serviceWorker' in navigator){
